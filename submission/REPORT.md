@@ -155,3 +155,21 @@ $ .\.venv\Scripts\python.exe -m scripts.parity
   [OK ] gold_feature_daily   lite 8630e04a61d1  dbt 8630e04a61d1
 RESULT: PARITY — both implementations agree
 ```
+
+### Bonus
+
+- B1: thay `label_tickets` trong `pipeline/llm_label.py`: cache raw answer theo hash(input)+model+prompt_version (bảng `llm_label_cache`), parse/validate schema, câu off-schema vào `llm_label_quarantine`, label gắn model + prompt_version.
+- B2 (brainstorm): [`bonus/DESIGN.md`](../bonus/DESIGN.md). Bản nháp do Claude Code soạn từ bài toán flywheel CSKH; tôi đã đọc và chịu trách nhiệm nội dung.
+
+```text
+$ .\.venv\Scripts\python.exe -m scripts.bonus_llm
+=== bonus: LLM labelling of 11 live tickets ===
+  cost estimate before running: ~484 tokens = $0.0010 per full run
+  [OK ] first run labels every live ticket
+  [OK ] re-run with same model + prompt makes 0 LLM calls
+  [OK ] every Gold label is bug / billing / other
+  [OK ] off-schema answers go to llm_label_quarantine
+  [OK ] new prompt version re-labels on purpose
+  [OK ] labels carry their prompt version
+BONUS PASS
+```

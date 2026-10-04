@@ -11,13 +11,14 @@ expensive, slow and NOT deterministic, so the slide's four rules apply:
   3. estimate the cost BEFORE running (rows x tokens x price)
   4. LLM labels are versioned data (model + prompt_version stored on every row)
 
-The shipped `label_tickets` is the NAIVE version: it calls the model for every
-ticket on every run and writes whatever comes back. Your bonus task is to make
-`python -m scripts.bonus_llm` print BONUS PASS. Zero-key: `FakeLLM` stands in for a
+`label_tickets` caches raw answers by hash(input)+model+prompt version, validates
+them against the schema and quarantines off-schema answers (`python -m scripts.bonus_llm`
+prints BONUS PASS). Zero-key: `FakeLLM` stands in for a
 real model (swap in any provider via .env if you like — the pipeline is the same).
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 
@@ -80,14 +81,46 @@ def live_tickets(con: duckdb.DuckDBPyConnection) -> list[tuple[str, str]]:
     """).fetchall()
 
 
+def input_hash(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
 def label_tickets(con: duckdb.DuckDBPyConnection, llm: FakeLLM) -> dict:
-    """NAIVE version (shipped): one LLM call per ticket per run, no validation."""
-    rows = []
+    """Cached, validated version.
+
+    * cache key = hash(input) + model + prompt version; the RAW answer is cached
+      (valid or not), so a re-run makes 0 calls and re-validates deterministically
+    * the answer is parsed against the schema; off-schema -> llm_label_quarantine,
+      never gold_ticket_labels
+    * gold_ticket_labels and the quarantine are rebuilt each run (idempotent)
+    """
+    con.execute("""CREATE TABLE IF NOT EXISTS llm_label_cache (
+        input_hash VARCHAR, model VARCHAR, prompt_version VARCHAR, raw VARCHAR)""")
+    model, version = llm.model, PROMPT_VERSION
+    calls_before = llm.calls
+    labels, quarantined = [], []
     for ticket_id, text in live_tickets(con):
-        raw = llm.complete(PROMPT_TEMPLATE.format(text=text))
-        rows.append((ticket_id, raw, MODEL, PROMPT_VERSION))
+        h = input_hash(text)
+        hit = con.execute(
+            "SELECT raw FROM llm_label_cache WHERE input_hash = ? AND model = ? AND prompt_version = ?",
+            [h, model, version]).fetchone()
+        if hit:
+            raw = hit[0]
+        else:
+            raw = llm.complete(PROMPT_TEMPLATE.format(text=text))
+            con.execute("INSERT INTO llm_label_cache VALUES (?, ?, ?, ?)", [h, model, version, raw])
+        label = parse_label(raw)
+        if label is None:
+            quarantined.append((ticket_id, raw, model, version))
+        else:
+            labels.append((ticket_id, label, model, version))
     con.execute("""CREATE OR REPLACE TABLE gold_ticket_labels (
         ticket_id VARCHAR, label VARCHAR, model VARCHAR, prompt_version VARCHAR)""")
-    if rows:
-        con.executemany("INSERT INTO gold_ticket_labels VALUES (?, ?, ?, ?)", rows)
-    return {"labeled": len(rows), "calls": llm.calls}
+    con.execute("""CREATE OR REPLACE TABLE llm_label_quarantine (
+        ticket_id VARCHAR, raw VARCHAR, model VARCHAR, prompt_version VARCHAR)""")
+    if labels:
+        con.executemany("INSERT INTO gold_ticket_labels VALUES (?, ?, ?, ?)", labels)
+    if quarantined:
+        con.executemany("INSERT INTO llm_label_quarantine VALUES (?, ?, ?, ?)", quarantined)
+    return {"labeled": len(labels), "quarantined": len(quarantined),
+            "calls": llm.calls - calls_before}
