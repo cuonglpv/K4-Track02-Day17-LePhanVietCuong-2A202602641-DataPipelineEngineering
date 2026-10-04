@@ -2,7 +2,7 @@
 
 ## Bài toán và ràng buộc thực
 
-Một chatbot CSKH cho ví điện tử/ngân hàng số tại Việt Nam xử lý khoảng 200k hội thoại mỗi ngày. Mỗi hội thoại sinh ra trace (câu hỏi, tài liệu RAG được truy xuất, câu trả lời, phản hồi 👍/👎, và đôi khi agent người tiếp quản). Đội ML muốn biến trace thành **eval set** và **dữ liệu fine-tune/DPO** mỗi tuần. Khó ở chỗ: (1) văn bản chứa PII (tên, CCCD, số tài khoản, số điện thoại) bằng tiếng Việt có dấu mà regex không bắt hết; (2) phản hồi đến muộn và có thể bị sửa/xoá khi khách yêu cầu xoá dữ liệu; (3) nếu trace dùng để train lại bị rò sang eval set thì điểm eval vô nghĩa; (4) ngân sách LLM-as-judge có hạn.
+Một chatbot CSKH cho ví điện tử/ngân hàng số tại Việt Nam xử lý một lượng lớn hội thoại mỗi ngày (giả định khoảng 200k để tính quy mô). Mỗi hội thoại sinh ra trace (câu hỏi, tài liệu RAG được truy xuất, câu trả lời, phản hồi 👍/👎, và đôi khi agent người tiếp quản). Đội ML muốn biến trace thành **eval set** và **dữ liệu fine-tune/DPO** mỗi tuần. Khó ở chỗ: (1) văn bản chứa PII (tên, CCCD, số tài khoản, số điện thoại) bằng tiếng Việt có dấu mà regex không bắt hết; (2) phản hồi đến muộn và có thể bị sửa/xoá khi khách yêu cầu xoá dữ liệu; (3) nếu trace dùng để train lại bị rò sang eval set thì điểm eval vô nghĩa; (4) ngân sách LLM-as-judge có hạn.
 
 ```
 App/Bot ──trace──▶ Kafka ─▶ Bronze (Parquet, bất biến, PII thô, mã hoá, TTL ngắn)
@@ -26,9 +26,9 @@ Feedback/CDC ────────────────▶ Bronze
 
 **4. PII tiếng Việt → nhiều lớp, chốt ở Silver và lần nữa trước Gold.** Regex bắt email/số điện thoại/CCCD; NER tiếng Việt (hoặc từ điển tên từ bảng khách hàng) che tên; mẫu nghi ngờ vào quarantine thay vì đi tiếp. Đo bằng bộ mẫu gán nhãn tay (recall PII mục tiêu ≥ 0.99, báo riêng cho tên) và đếm PII còn sót khi quét Gold, phải bằng 0. Đánh đổi: che quá tay làm mất ngữ nghĩa train; ưu tiên recall hơn precision vì rủi ro pháp lý (Nghị định 13/2023 về bảo vệ dữ liệu cá nhân) nặng hơn rủi ro mất chút chất lượng.
 
-**5. Quyền xoá vs snapshot bất biến → tách PII khỏi snapshot, xoá lan bằng tombstone.** Snapshot chỉ chứa `trace_id` và văn bản đã scrub; khi có yêu cầu xoá thì ghi tombstone ở Silver (giữ khoá và LSN để replay không hồi sinh), tạo version Gold mới không chứa user đó, thu hồi version cũ và model đã train từ chúng. Đánh đổi: tốn thêm một lần train lại so với "chấp nhận snapshot cũ còn dữ liệu", nhưng cái sau không bảo vệ được quyền xoá.
+**5. Quyền xoá vs snapshot bất biến → tách PII khỏi snapshot, xoá lan bằng tombstone.** Snapshot chỉ chứa `trace_id` và văn bản đã scrub; khi có yêu cầu xoá thì ghi tombstone ở Silver (giữ khoá và LSN để replay không hồi sinh), tạo version Gold mới không chứa user đó, thu hồi version cũ và đánh dấu các model đã train từ chúng để quyết định train lại (không thể "xoá" dữ liệu khỏi trọng số model đã train). Đánh đổi: tốn thêm một lần train lại so với "chấp nhận snapshot cũ còn dữ liệu", nhưng cái sau không bảo vệ được quyền xoá.
 
-**6. LLM-as-judge → cache theo hash(input)+model+prompt_version, validate schema, ước tính chi phí trước.** Cùng cơ chế với B1 trong lab: chạy lại 0 lần gọi, đổi prompt thì chấm lại có chủ đích, câu trả lời sai schema vào quarantine. Đánh đổi: bộ nhớ cache tăng theo số phiên bản prompt, nhưng chi phí judge (khoảng 80% hoá đơn LLM của pipeline) giảm mạnh khi backfill.
+**6. LLM-as-judge → cache theo hash(input)+model+prompt_version, validate schema, ước tính chi phí trước.** Cùng cơ chế với B1 trong lab: chạy lại 0 lần gọi, đổi prompt thì chấm lại có chủ đích, câu trả lời sai schema vào quarantine. Đánh đổi: bộ nhớ cache tăng theo số phiên bản prompt, nhưng chi phí judge (giả định là khoản LLM lớn nhất của pipeline; cần đo bằng log chi phí thực tế trước khi tối ưu) giảm mạnh khi backfill.
 
 ## Phương án bị loại
 
@@ -36,4 +36,4 @@ Feedback/CDC ────────────────▶ Bronze
 
 ## Chi phí và quy mô
 
-Ở 10× dữ liệu, điểm nghẽn đầu tiên là chi phí LLM judge và số file nhỏ ở Bronze (nên compact theo giờ), không phải tính toán Silver/Gold. DuckDB/dbt đủ cho một node đến cỡ vài trăm triệu dòng; khi vượt thì chuyển Gold sang Spark/lakehouse mà giữ nguyên contract và bộ kiểm tra checksum.
+Ở 10× dữ liệu, điểm nghẽn đầu tiên là chi phí LLM judge và số file nhỏ ở Bronze (nên compact theo giờ), không phải tính toán Silver/Gold. DuckDB/dbt đủ cho một node ở quy mô hiện tại (cần benchmark để xác định ngưỡng thực); khi vượt ngưỡng đó thì chuyển Gold sang Spark/lakehouse mà giữ nguyên contract và bộ kiểm tra checksum.
